@@ -1,0 +1,32 @@
+# ===== 敏感信息（务必不要上传）=====
+# 存放 API Key、数据库密码等，仅供本地使用
+.env
+*.env
+
+# ===== 向量数据库（体积过大，可通过重新导入资料重建）=====
+chroma_db/
+
+# 去重记录，随向量库一起重建
+md5.txt
+
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ===== 临时文件 =====
+*.tmp
+~$*
