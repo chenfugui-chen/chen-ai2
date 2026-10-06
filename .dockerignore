@@ -1,0 +1,30 @@
+# 构建镜像时排除，避免把敏感信息/大文件打进镜像
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# 敏感配置：密钥只在宿主机 .env 里，绝不进镜像
+.env
+*.env
+
+# 运行时数据：由宿主机挂载卷提供
+chroma_db/
+md5.txt
+*.log
+
+# 虚拟环境与编辑器
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 临时文件与重复资料
+~$*
+*.tmp
+资料/

@@ -1,0 +1,15 @@
+[server]
+# 容器/服务器环境必须用 headless 模式（不尝试自动打开浏览器）
+headless = true
+# 监听所有网卡，容器外才能通过端口映射访问
+address = "0.0.0.0"
+port = 8501
+# 关闭文件热重载监视器：它会遍历探测所有已加载模块的路径，触发 transformers
+# 懒加载一堆视觉模型子模块，而本项目未装 torchvision，导致控制台被大量
+# "No module named 'torchvision'" 噪音刷屏（仅是噪声，不影响功能）。
+# 代价：改代码后不会自动重载，需手动刷新页面/重启；如需自动重载可改回 "auto"。
+fileWatcherType = "none"
+
+[browser]
+# 关闭使用统计上报
+gatherUsageStats = false

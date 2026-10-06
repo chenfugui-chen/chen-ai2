@@ -1,15 +1,74 @@
-import os
+import json
+
+import requests
 import streamlit as st
-from knowledge_base import KnowledgeBaseService, extract_text_from_file  # extract_text_from_file 用来把上传的文件解析成纯文本给用户预览
-from history_store import HistoryStore
-from rag import RagService
+
+import config_data as config
+
+# 后端 API（FastAPI）地址：对话走 SSE、会话管理走 REST，前端不直连数据库、不持有大模型密钥
+API_BASE = config.api_base_url
 
 
-# ===== 全局对象初始化（仅运行一次） =====
-if "service" not in st.session_state:
-    st.session_state["service"] = KnowledgeBaseService()
-if "history_store" not in st.session_state:
-    st.session_state["history_store"] = HistoryStore()
+# ===== 后端 API 调用 =====
+
+def api_list_conversations() -> list[dict]:
+    """会话列表"""
+    try:
+        resp = requests.get(f"{API_BASE}/conversations", timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.sidebar.error(f"获取会话列表失败：{e}")
+        return []
+
+
+def api_get_messages(conv_id: int) -> list[dict]:
+    """某个会话的历史消息"""
+    try:
+        resp = requests.get(f"{API_BASE}/conversations/{conv_id}/messages", timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.error(f"获取历史消息失败：{e}")
+        return []
+
+
+def api_delete_conversation(conv_id: int) -> None:
+    """删除会话"""
+    try:
+        requests.delete(f"{API_BASE}/conversations/{conv_id}", timeout=15)
+    except Exception as e:
+        st.sidebar.error(f"删除会话失败：{e}")
+
+
+def stream_chat(message: str, conversation_id: int | None):
+    """
+    调用后端 SSE 接口，逐条产出事件 dict：{"event": 事件名, "data": 数据}。
+    事件：meta / tool_call / tool_result / answer / usage / done / error
+    """
+    with requests.post(
+        f"{API_BASE}/chat/stream",
+        json={"message": message, "conversation_id": conversation_id},
+        stream=True,
+        timeout=300,
+    ) as resp:
+        resp.raise_for_status()
+        event_name = "message"
+        for raw in resp.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+            if raw.startswith("event:"):
+                event_name = raw[len("event:"):].strip()
+            elif raw.startswith("data:"):
+                payload = raw[len("data:"):].strip()
+                try:
+                    data = json.loads(payload)
+                except json.JSONDecodeError:
+                    data = {"raw": payload}
+                yield {"event": event_name, "data": data}
+
+
+# ===== 全局状态 =====
 if "current_conv_id" not in st.session_state:
     st.session_state["current_conv_id"] = None
 
@@ -24,7 +83,7 @@ with st.sidebar:
 
     st.divider()
 
-    convs = st.session_state["history_store"].list_conversations()
+    convs = api_list_conversations()
     if not convs:
         st.caption("暂无历史会话")
     for conv in convs:
@@ -38,145 +97,111 @@ with st.sidebar:
                 st.rerun()
         with col2:
             if st.button("🗑️", key=f"del_{conv['id']}"):
-                st.session_state["history_store"].delete_conversation(conv["id"])
+                api_delete_conversation(conv["id"])
                 if st.session_state["current_conv_id"] == conv["id"]:
                     st.session_state["current_conv_id"] = None
                 st.rerun()
 
 
-# ===== 主界面 =====
-st.title("📚 AI知识库问答系统")
+# ===== 主界面：与个人 AI 助手对话 =====
+st.title("🤖 陈欣凯的个人 AI 助手")
+st.caption("可以问我：你是谁 / 你的专业是什么 / 你做过哪些项目 / 你的实习经历 / 你掌握哪些技术")
 
-# ===== 区域1：上传知识库 =====
-with st.expander("📤 上传知识库文件", expanded=False):
-    st.caption("💡 支持格式：.txt（记事本）/ .csv / .pdf / .doc / .docx（Word）/ .xls / .xlsx（Excel）")
-    uploaded_file = st.file_uploader(
-        "上传文件",
-        type = ["txt", "csv", "pdf", "doc", "docx", "xls", "xlsx"],  # 支持 7 种常见文档格式（含旧版 doc/xls、CSV）
-        accept_multiple_files = False,
+st.info(
+    "👋 您好！我是陈欣凯的 AI 数字分身，只回答与「他的经历」和「已导入知识库」相关的问题。\n\n"
+    "**给 HR：** 想快速判断他是否适合某个岗位？把**岗位职责 / 任职要求**粘贴到下方"
+    "「🎯 岗位匹配分析」中，我会结合他的真实资料给出匹配度分析。"
+)
+
+# ===== 岗位匹配分析（HR 粘贴岗位职责） =====
+with st.expander("🎯 岗位匹配分析（HR 专用）", expanded=False):
+    st.caption("把岗位职责 / 任职要求粘贴到下面，我会结合陈欣凯的个人资料分析匹配度，重点突出相符的经历与技术点")
+    jd_text = st.text_area(
+        "岗位职责 / 任职要求",
+        height=200,
+        key="jd_text",
+        placeholder="粘贴招聘 JD 中的岗位职责与任职要求……",
     )
-
-    if uploaded_file is not None:
-        file_name = uploaded_file.name
-        file_type = uploaded_file.type
-        file_size = uploaded_file.size
-        file_bytes = uploaded_file.getvalue()  # 拿二进制原始内容（pdf/docx/xlsx 不能直接 decode utf-8，会报错！）
-
-        # 第一步：把二进制内容根据后缀解析成纯文本（内部自动选 txt/pdf/docx/xlsx 解析器）
-        file_text = extract_text_from_file(file_bytes, file_name)
-
-        st.subheader(f"📄 文件名：{file_name}")
-        size_kb = file_size / 1024  # 字节转 KB，原来显示 B 太小看不清
-        st.write(f"文件类型：{file_type}，大小：{size_kb:.1f} KB")
-
-        # 第二步：显示解析后的文本预览（让用户确认解析是否正确，再决定要不要入库）
-        if not file_text or not file_text.strip():
-            # 解析后空内容：大概率是扫描版PDF（纯图片），或者加密/损坏文件
-            st.error("❌ 文件解析失败：未提取到可读文本内容")
-            st.caption("可能原因：① PDF 是扫描件/纯图片（需先做 OCR）；② 文件加密；③ 文件已损坏")
+    if st.button("🔍 分析匹配度", key="jd_analyze"):
+        if not jd_text.strip():
+            st.warning("请先粘贴岗位职责 / 任职要求")
         else:
-            # 解析成功：显示内容预览折叠面板
-            st.success(f"✅ 文件解析成功，共提取到约 {len(file_text)} 个字符")
-            with st.expander("👁️ 查看解析后的文件内容", expanded=False):
-                st.code(file_text, language=None)  # 用 code 块显示长文本更整洁，不乱换行
-
-            # 第三步：调用 KnowledgeBaseService 的 upload_by_str 入库
-            # （MD5去重 + 分块 + 向量化 + 存Chroma，逻辑和之前完全一样）
-            result = st.session_state["service"].upload_by_str(file_text, file_name)
-            if "成功" in result:
-                st.success(f"🎉 {result}")
+            with st.spinner("正在结合个人资料分析匹配度（约十几秒）……"):
+                try:
+                    resp = requests.post(f"{API_BASE}/match", json={"job_description": jd_text}, timeout=300)
+                    resp.raise_for_status()
+                    result = resp.json()
+                except Exception as e:
+                    result = {"error": str(e)}
+            if result.get("error"):
+                st.error(f"❌ 分析失败：{result['error']}")
             else:
-                st.warning(f"⚠️ {result}")
-
-    # ===== 文件夹批量导入 =====
-    st.divider()
-    st.caption("📁 批量导入：填写本机文件夹路径，自动递归扫描并导入该文件夹下所有支持格式的文件（.txt/.pdf/.doc/.docx/.xls/.xlsx）")
-
-    folder_path = st.text_input(
-        "文件夹路径",
-        placeholder=r"例如：D:\资料\产品手册",
-        key="folder_path_input",
-    )
-
-    if st.button("🚀 扫描并批量导入", use_container_width=True):
-        if not folder_path or not os.path.isdir(folder_path):
-            # 路径为空或不存在，直接提示，不往下走
-            st.error(f"❌ 文件夹不存在或不是有效目录：{folder_path}")
-        else:
-            # 递归扫描该文件夹（含子文件夹）下所有支持格式的文件
-            supported_suffix = {".txt", ".csv", ".pdf", ".doc", ".docx", ".xls", ".xlsx"}
-            file_list = []
-            for root, _, files in os.walk(folder_path):
-                for name in files:
-                    # 跳过 Word/Excel 生成的临时锁文件（~$ 开头），它们不是真正的文档
-                    if name.startswith("~$"):
-                        continue
-                    if os.path.splitext(name)[1].lower() in supported_suffix:
-                        file_list.append(os.path.join(root, name))
-
-            if not file_list:
-                st.warning("⚠️ 该文件夹下没有找到支持格式的文件")
-            else:
-                st.info(f"共找到 {len(file_list)} 个文件，开始导入（大文件夹请耐心等待）...")
-                progress = st.progress(0.0)
-                ok, skip, fail = 0, 0, 0
-                fail_files = []
-                # 逐个文件处理：每次只读一个文件进内存，200MB 文件夹也不会爆内存
-                for idx, path in enumerate(file_list):
-                    name = os.path.basename(path)
-                    try:
-                        with open(path, "rb") as f:
-                            file_bytes = f.read()
-                        file_text = extract_text_from_file(file_bytes, name)
-                        if not file_text or not file_text.strip():
-                            fail += 1
-                            fail_files.append(f"{name}（未提取到文本，可能是扫描件/加密/损坏）")
-                        else:
-                            result = st.session_state["service"].upload_by_str(file_text, name)
-                            if "成功" in result:
-                                ok += 1
-                            elif "已存在" in result:
-                                skip += 1  # MD5 去重命中，说明之前已导入过
-                            else:
-                                fail += 1
-                                fail_files.append(f"{name}（{result}）")
-                    except Exception as e:
-                        fail += 1
-                        fail_files.append(f"{name}（读取失败：{e}）")
-                    progress.progress((idx + 1) / len(file_list), text=f"已处理 {idx + 1}/{len(file_list)}：{name}")
-
-                st.success(f"🎉 导入完成：成功 {ok} 个，跳过（已存在）{skip} 个，失败 {fail} 个")
-                if fail_files:
-                    with st.expander(f"⚠️ 查看失败的 {len(fail_files)} 个文件", expanded=False):
-                        for item in fail_files:
-                            st.write(f"· {item}")
-
-
-# ===== 区域2：聊天问答 =====
-st.divider()
-st.subheader("💡 智能问答")
+                st.success("✅ 分析完成")
+                st.markdown(result.get("analysis", ""))
 
 if st.session_state["current_conv_id"] is not None:
-    history = st.session_state["history_store"].get_history_messages(st.session_state["current_conv_id"])
+    history = api_get_messages(st.session_state["current_conv_id"])
     for msg in history:
         avatar = "🧑" if msg["role"] == "user" else "🤖"
         with st.chat_message(msg["role"], avatar=avatar):
             st.write(msg["content"])
+
+    # 最近一次回答的「执行链路」：默认折叠，点开可看每步（工具调用 / 结果 / token 用量）
+    last_chain = st.session_state.get("last_chain")
+    if last_chain and last_chain.get("conv_id") == st.session_state["current_conv_id"] and last_chain.get("steps"):
+        with st.expander("🔗 执行链路（本次回答是如何得到的）", expanded=False):
+            for step in last_chain["steps"]:
+                st.markdown(step)
 else:
     st.caption("💡 提示：在下方输入问题即可开启新会话，或从左侧选择历史会话")
 
 user_input = st.chat_input("请输入你的问题")
 if user_input:
-    rag = RagService(conversation_id=st.session_state["current_conv_id"])
-
     with st.chat_message("user", avatar="🧑"):
         st.write(user_input)
 
-    with st.spinner("🤖别急 我正在思考中..."):
-        answer = rag.ask(user_input)
-
     with st.chat_message("assistant", avatar="🤖"):
-        st.write(answer)
+        # 思考过程中实时展示工具调用；完成后收起，改由下方「执行链路」面板保留
+        status = st.status("🤖 正在查阅资料并思考…", expanded=True)
+        answer_box = st.empty()
+        answer_text = ""
+        chain = []  # 记录本次回答的执行链路，供回答完成后折叠展示
+        conv_id = st.session_state["current_conv_id"]
+        errored = None
 
-    st.session_state["current_conv_id"] = rag.conversation_id
+        try:
+            for ev in stream_chat(user_input, conv_id):
+                name, data = ev["event"], ev["data"]
+                if name == "meta":
+                    conv_id = data.get("conversation_id", conv_id)
+                elif name == "tool_call":
+                    step = f"🔧 调用工具 `{data.get('name')}`：`{data.get('args')}`"
+                    status.write(step)
+                    chain.append(step)
+                elif name == "tool_result":
+                    step = f"📄 `{data.get('name')}` 返回 {data.get('chars')} 字"
+                    status.write(step)
+                    chain.append(step)
+                elif name == "answer":
+                    # 打字机效果：每来一段增量就重渲染
+                    answer_text += data.get("delta", "")
+                    answer_box.markdown(answer_text + "▌")
+                elif name == "usage":
+                    step = f"🧮 token 用量：{data}"
+                    status.write(step)
+                    chain.append(step)
+                elif name == "error":
+                    errored = data.get("message", "未知错误")
+        except Exception as e:
+            errored = f"连接后端失败：{e}"
+
+        if errored:
+            answer_box.error(f"❌ {errored}")
+            status.update(label="❌ 出错了", state="error", expanded=True)
+        else:
+            answer_box.markdown(answer_text)
+            status.update(label="✅ 回答完成", state="complete", expanded=False)
+
+    st.session_state["current_conv_id"] = conv_id
+    st.session_state["last_chain"] = {"conv_id": conv_id, "steps": chain}
     st.rerun()

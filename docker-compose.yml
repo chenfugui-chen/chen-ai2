@@ -1,0 +1,47 @@
+# 生产部署编排：app（Streamlit + Agent） + mysql（会话存储）
+# 启动：docker compose up -d --build
+# 注意：所有密码/密钥都从同目录的 .env 读取，不要写进本文件
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DB:-ai_rag}
+      MYSQL_USER: ${MYSQL_USER:-airag}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # 首次启动时自动执行，建 conversation / message 两张表
+      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # 容器内通过服务名 mysql 访问数据库（覆盖 .env 里的 127.0.0.1）
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+    ports:
+      # 只绑定宿主机本地端口，公网访问统一走宿主机上的 Nginx 反向代理
+      - "127.0.0.1:8501:8501"
+    volumes:
+      # 挂载项目目录：profile/、chroma_db/、md5.txt、profile/_meta.json 等运行时数据持久化在宿主机
+      - .:/app
+      # 本地嵌入模型缓存（约 90MB）：命名卷持久化，重建镜像后不必重新下载
+      - fastembed_cache:/root/.cache/fastembed
+
+volumes:
+  mysql_data:
+  fastembed_cache:

@@ -9,6 +9,11 @@ chroma_db/
 # 去重记录，随向量库一起重建
 md5.txt
 
+# ===== 个人真实资料（隐私，不上传）=====
+# 资料/：待导入知识库的原始文件；profile/：个人资料库（含 LLM 描述缓存 _meta.json）
+资料/
+profile/
+
 # ===== Python 缓存 =====
 __pycache__/
 *.py[cod]

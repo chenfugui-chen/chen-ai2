@@ -1,5 +1,6 @@
 import pymysql
 import config_data as config
+from contextlib import contextmanager
 from datetime import datetime
 
 
@@ -17,9 +18,18 @@ class HistoryStore:
             "cursorclass": pymysql.cursors.DictCursor,
         }
 
+    @contextmanager
     def _get_conn(self):
-        """内部方法：获取数据库连接，用完自动关闭"""
-        return pymysql.connect(**self.db_config)
+        """
+        内部方法：获取数据库连接，退出 with 时自动关闭。
+        注意：PyMySQL 的 `with conn:` 只负责提交/回滚事务，并不会关闭连接，
+        长时间运行的 Web 服务若只依赖它会导致连接泄漏（Too many connections）。
+        """
+        conn = pymysql.connect(**self.db_config)
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     # ========== 会话（conversation）相关 ==========
 
@@ -69,13 +79,27 @@ class HistoryStore:
                 )
                 conn.commit()
 
-    def get_history_messages(self, conv_id: int) -> list[dict]:
+    def get_history_messages(self, conv_id: int, limit: int | None = None) -> list[dict]:
+        """
+        取某个会话的历史消息（按时间正序）。
+        :param limit: 只取最近 limit 条；为 None 表示不限（注意：太久不限制会把提示词撑爆）
+        """
         with self._get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT role, content FROM message WHERE conversation_id = %s ORDER BY created_at ASC",
-                    (conv_id,),
-                )
+                if limit is None:
+                    cur.execute(
+                        "SELECT role, content FROM message WHERE conversation_id = %s ORDER BY id ASC",
+                        (conv_id,),
+                    )
+                else:
+                    # 先按 id 倒序取最近 limit 条，再翻转成正序返回
+                    cur.execute(
+                        "SELECT role, content FROM ("
+                        "  SELECT id, role, content FROM message"
+                        "  WHERE conversation_id = %s ORDER BY id DESC LIMIT %s"
+                        ") AS recent ORDER BY id ASC",
+                        (conv_id, limit),
+                    )
                 return cur.fetchall()
 
     @staticmethod
